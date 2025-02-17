@@ -1,0 +1,9 @@
+import os
+
+# Binance API Anahtarları
+os.environ["API_KEY"] = "70545197030f91dcd85316478ef03e15fdf565514a0bfcd6afe915dc93b0c69b"
+os.environ["API_SECRET"] = "8c403fbf9b9bdd003bc38a7162f89b96f8f97a3df48244a542685023dc9b2033"
+
+# Blockchain API Anahtarları (Etherscan & BscScan)
+os.environ["ETHERSCAN_API_KEY"] = "AQCCV7EVH32599XDTKJYYHEW32B6BBHEGT"
+os.environ["BSCSCAN_API_KEY"] = "4Q7W8MV57J2RKXAIR59C53AIZQPXKNK51Z"
