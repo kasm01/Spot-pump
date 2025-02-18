@@ -1,0 +1,111 @@
+import asyncio
+import websockets
+import requests
+import json
+import numpy as np
+import pandas as pd
+import time
+import threading
+import cachetools
+from binance.client import Client
+from binance.enums import ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
+import ta
+import logging
+import os
+
+# Binance API Anahtarları
+API_KEY = os.environ.get("API_KEY")
+API_SECRET = os.environ.get("API_SECRET")
+client = Client(API_KEY, API_SECRET)
+
+# Blockchain API Anahtarları
+ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY")
+BSCSCAN_API_KEY = os.environ.get("BSCSCAN_API_KEY")
+
+# Websocket Veri Önbellekleme
+cache = cachetools.TTLCache(maxsize=100, ttl=5)
+
+# Risk Yönetimi ve İşlem Parametreleri
+TRAILING_STOP_LOSS_FACTOR = 0.97
+DYNAMIC_TAKE_PROFIT_FACTOR = 1.05
+LEVERAGE = 3
+BALANCE_USAGE = 0.3
+
+# Hata Yönetimi ve Loglama
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Gerçek Zamanlı Veri Çekme
+trade_data = []
+lock = threading.Lock()
+
+def preprocess_data(df):
+    """Teknik analiz göstergelerini hesaplar."""
+    df['return'] = df['price'].pct_change()
+    df['CMF'] = ta.volume.chaikin_money_flow(df, high='price', low='price', close='price', volume='volume')
+    df['OBV'] = ta.volume.on_balance_volume(df['price'], df['volume'])
+    df['STOCH_K'], df['STOCH_D'] = ta.momentum.stoch(df['price'], df['price'], df['price'])
+    df['ATR'] = ta.volatility.average_true_range(df['price'], df['price'], df['price'], window=14)
+    df['MACD'] = ta.trend.macd(df['price'])
+    df['MACD_SIGNAL'] = ta.trend.macd_signal(df['price'])
+    df['RSI'] = ta.momentum.rsi(df['price'], window=14)
+    df['BOLL_UPPER'], df['BOLL_MIDDLE'], df['BOLL_LOWER'] = ta.volatility.bollinger_hband(df['price']), ta.volatility.bollinger_mavg(df['price']), ta.volatility.bollinger_lband(df['price'])
+    return df
+
+def analyze_market():
+    try:
+        df = pd.DataFrame(trade_data, columns=['timestamp', 'price', 'volume'])
+        df = preprocess_data(df)
+
+        if df['return'].iloc[-1] > 0.05 and df['CMF'].iloc[-1] > 0 and df['OBV'].iloc[-1] > df['OBV'].iloc[-2] and \
+           df['STOCH_K'].iloc[-1] > df['STOCH_D'].iloc[-1] and df['ATR'].iloc[-1] > df['ATR'].iloc[-2] and \
+           df['MACD'].iloc[-1] > df['MACD_SIGNAL'].iloc[-1] and df['RSI'].iloc[-1] < 70:
+            logging.info("🚀 ALIM SİNYALİ: Pump Tespit Edildi!")
+            place_order("BTCUSDT", SIDE_BUY, 0.01, df['price'].iloc[-1])
+    except Exception as e:
+        logging.error(f"Piyasa analizi sırasında hata oluştu: {e}")
+
+def place_order(symbol, side, quantity, entry_price):
+    try:
+        balance = float(client.futures_account_balance()[0]['balance']) * BALANCE_USAGE
+        quantity = (balance / entry_price) * LEVERAGE
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+        logging.info(f"📌 İşlem Açıldı: {side} {quantity} {symbol} @ {entry_price}")
+
+        stop_loss = entry_price * TRAILING_STOP_LOSS_FACTOR
+        take_profit = entry_price * DYNAMIC_TAKE_PROFIT_FACTOR
+        logging.info(f"🛑 Trailing Stop-Loss: {stop_loss}, 🎯 Take-Profit: {take_profit}")
+    except Exception as e:
+        logging.error(f"İşlem açma sırasında hata oluştu: {e}")
+
+async def websocket_listener():
+    uri = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    async with websockets.connect(uri) as websocket:
+        while True:
+            message = await websocket.recv()
+            data = json.loads(message)
+            price = float(data['p'])
+            volume = float(data['q']) * price
+            timestamp = int(data['T'])
+            with lock:
+                trade_data.append([timestamp, price, volume])
+            analyze_market()
+
+async def backtesting():
+    """Gerçek piyasa verileriyle AI modelini test etmek için backtesting çalıştırır."""
+    logging.info("🔍 Backtesting Başlatılıyor...")
+    historical_data = pd.read_csv("historical_data.csv")
+    for index, row in historical_data.iterrows():
+        analyze_market()
+        await asyncio.sleep(0.1)
+    logging.info("✅ Backtesting Tamamlandı!")
+
+# Çoklu İş Parçacığı Kullanarak Websocket Çalıştır
+threading.Thread(target=lambda: asyncio.run(websocket_listener()), daemon=True).start()
+threading.Thread(target=lambda: asyncio.run(backtesting()), daemon=True).start()
