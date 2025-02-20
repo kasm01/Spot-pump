@@ -18,7 +18,7 @@ import os
 # Binance API Anahtarları
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET")
-client = Client(API_KEY, API_SECRET)
+client = Client(API_KEY, API_SECRET, testnet=true)
 
 # Blockchain API Anahtarları
 ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY")
