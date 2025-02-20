@@ -1,0 +1,164 @@
+import asyncio
+import websockets
+import requests
+import json
+import numpy as np
+import pandas as pd
+import time
+import threading
+import cachetools
+from binance.client import Client
+from binance.enums import ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout
+import ta
+import logging
+import os
+
+# 📌 Binance API Anahtarları
+API_KEY = os.environ.get("API_KEY")
+API_SECRET = os.environ.get("API_SECRET")
+client = Client(API_KEY, API_SECRET, testnet=True)
+
+# 📌 Blockchain API Anahtarları
+ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY")
+BSCSCAN_API_KEY = os.environ.get("BSCSCAN_API_KEY")
+
+# 📌 Websocket Veri Önbellekleme
+cache = cachetools.TTLCache(maxsize=100, ttl=5)
+
+# 📌 Risk Yönetimi ve İşlem Parametreleri
+TRAILING_STOP_LOSS_FACTOR = 0.97
+DYNAMIC_TAKE_PROFIT_FACTOR = 1.05
+LEVERAGE = 3
+BALANCE_USAGE = 0.3
+
+# 📌 Hata Yönetimi ve Loglama
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# 📌 Gerçek Zamanlı Veri Çekme
+trade_data = []
+lock = threading.Lock()
+
+# 📌 Teknik Analiz Göstergeleri Hesaplama
+def preprocess_data(df):
+    """Teknik analiz göstergelerini hesaplar."""
+    df['return'] = df['price'].pct_change()
+
+    cmf_indicator = ta.volume.ChaikinMoneyFlowIndicator(
+        high=df['price'], 
+        low=df['price'], 
+        close=df['price'], 
+        volume=df['volume']
+    )
+    df['CMF'] = cmf_indicator.chaikin_money_flow()
+
+    df['OBV'] = ta.volume.on_balance_volume(df['price'], df['volume'])
+
+    stoch_indicator = ta.momentum.StochasticOscillator(
+        high=df['price'], 
+        low=df['price'], 
+        close=df['price']
+    )
+    df['STOCH_K'] = stoch_indicator.stoch()
+    df['STOCH_D'] = stoch_indicator.stoch_signal()
+
+    df['ATR'] = ta.volatility.AverageTrueRange(
+        high=df['price'], 
+        low=df['price'], 
+        close=df['price'], 
+        window=14
+    ).average_true_range()
+
+    macd_indicator = ta.trend.MACD(df['price'])
+    df['MACD'] = macd_indicator.macd()
+    df['MACD_SIGNAL'] = macd_indicator.macd_signal()
+
+    df['RSI'] = ta.momentum.RSIIndicator(df['price'], window=14).rsi()
+
+    bollinger = ta.volatility.BollingerBands(df['price'])
+    df['BOLL_UPPER'] = bollinger.bollinger_hband()
+    df['BOLL_MIDDLE'] = bollinger.bollinger_mavg()
+    df['BOLL_LOWER'] = bollinger.bollinger_lband()
+
+    # Eksik verileri kontrol et ve doldur
+    df.fillna(0, inplace=True)
+    
+    return df
+
+# 📌 AI Destekli Piyasa Analizi
+def analyze_market():
+    try:
+        df = pd.DataFrame(trade_data, columns=['timestamp', 'price', 'volume'])
+        df = preprocess_data(df)
+
+        if df.empty:
+            logging.warning("⚠️ Veri eksik, analiz yapılamıyor!")
+            return
+
+        if df['return'].isnull().all():
+            logging.warning("⚠️ 'return' sütunu boş! Veri eksik olabilir.")
+            return
+
+        if df['return'].iloc[-1] > 0.05 and df['CMF'].iloc[-1] > 0 and df['OBV'].iloc[-1] > df['OBV'].iloc[-2] and \
+           df['STOCH_K'].iloc[-1] > df['STOCH_D'].iloc[-1] and df['ATR'].iloc[-1] > df['ATR'].iloc[-2] and \
+           df['MACD'].iloc[-1] > df['MACD_SIGNAL'].iloc[-1] and df['RSI'].iloc[-1] < 70:
+            logging.info("🚀 ALIM SİNYALİ: Pump Tespit Edildi!")
+            place_order("BTCUSDT", SIDE_BUY, 0.01, df['price'].iloc[-1])
+    except Exception as e:
+        logging.error(f"❌ Piyasa analizi sırasında hata oluştu: {e}", exc_info=True)
+
+# 📌 Binance Üzerinde İşlem Açma
+def place_order(symbol, side, quantity, entry_price):
+    try:
+        balance = float(client.futures_account_balance()[0]['balance']) * BALANCE_USAGE
+        quantity = (balance / entry_price) * LEVERAGE
+        order = client.futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+        logging.info(f"📌 İşlem Açıldı: {side} {quantity} {symbol} @ {entry_price}")
+
+        stop_loss = entry_price * TRAILING_STOP_LOSS_FACTOR
+        take_profit = entry_price * DYNAMIC_TAKE_PROFIT_FACTOR
+        logging.info(f"🛑 Stop-Loss: {stop_loss}, 🎯 Take-Profit: {take_profit}")
+    except Exception as e:
+        logging.error(f"❌ İşlem açma sırasında hata oluştu: {e}")
+
+# 📌 Binance Websocket Bağlantısı
+async def websocket_listener():
+    uri = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    async with websockets.connect(uri) as websocket:
+        while True:
+            try:
+                message = await websocket.recv()
+                data = json.loads(message)
+                price = float(data['p'])
+                volume = float(data['q']) * price
+                timestamp = int(data['T'])
+
+                with lock:
+                    trade_data.append([timestamp, price, volume])
+                
+                analyze_market()
+            except Exception as e:
+                logging.error(f"❌ Websocket hata verdi: {e}")
+
+# 📌 Backtesting Fonksiyonu
+async def backtesting():
+    """Gerçek piyasa verileriyle AI modelini test etmek için backtesting çalıştırır."""
+    logging.info("🔍 Backtesting Başlatılıyor...")
+    try:
+        historical_data = pd.read_csv("historical_data.csv")
+        for index, row in historical_data.iterrows():
+            analyze_market()
+            await asyncio.sleep(0.1)
+        logging.info("✅ Backtesting Tamamlandı!")
+    except FileNotFoundError:
+        logging.error("❌ historical_data.csv bulunamadı! Lütfen dosyayı yükleyin.")
+
+# 📌 Çoklu İş Parçacığı Kullanarak Websocket ve Backtesting Çalıştır
+threading.Thread(target=lambda: asyncio.run(websocket_listener()), daemon=True).start()
+threading.Thread(target=lambda: asyncio.run(backtesting()), daemon=True).start()
